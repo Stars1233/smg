@@ -44,7 +44,9 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{policy_filters_unavailable_workers, PolicyRegistry, SelectWorkerInfo},
+    policies::{
+        policy_filters_unavailable_workers, CacheNamespace, PolicyRegistry, SelectWorkerInfo,
+    },
     routers::{
         common::{
             attach_sized_body,
@@ -241,6 +243,7 @@ impl Router {
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
+        cache_namespace: Option<CacheNamespace>,
     ) -> Option<Arc<dyn Worker>> {
         let candidates = self
             .worker_registry
@@ -280,6 +283,7 @@ impl Router {
                 headers,
                 routing_key: self.policy_registry.resolve_routing_key(headers),
                 rid_key,
+                cache_namespace,
                 hash_ring,
                 leg: crate::policies::WorkerLeg::Single,
             },
@@ -382,6 +386,7 @@ impl Router {
             .policy_registry
             .derive_rid_key(typed_req.rid())
             .map(str::to_string);
+        let cache_namespace = CacheNamespace::derive(&typed_req.cache_partition());
         // Resolve once, here, so every registry, policy and metrics lookup
         // below is keyed by the canonical model ID. Only `get_by_model`
         // understands aliases; retry configs, hash rings and policies do not,
@@ -415,6 +420,7 @@ impl Router {
                 tokens: routing_tokens,
                 text,
                 rid_key,
+                cache_namespace,
             },
             ReleasePoint::from_retry_config(retry_config),
         );
@@ -523,7 +529,14 @@ impl Router {
         is_stream: bool,
     ) -> Response {
         let worker = match lease.with_view(|view| {
-            self.select_worker_for_model(model_id, view.text, view.tokens, headers, view.rid_key)
+            self.select_worker_for_model(
+                model_id,
+                view.text,
+                view.tokens,
+                headers,
+                view.rid_key,
+                view.cache_namespace,
+            )
         }) {
             Some(w) => w,
             None => {
@@ -859,6 +872,7 @@ impl Router {
                 headers,
                 routing_key: self.policy_registry.resolve_routing_key(headers),
                 rid_key: None,
+                cache_namespace: None,
                 hash_ring,
                 leg: crate::policies::WorkerLeg::Single,
             },
@@ -1686,14 +1700,17 @@ impl Router {
         let model_id = crate::worker::UNKNOWN_MODEL_ID;
         // Buffered-path parity: a valid tokens hint is exactly what selection
         // would have received there (text is never extracted alongside it).
-        // Streamed requests have no readable body, hence no rid key;
-        // routing-key override is excluded by the body-path gate above.
+        // Streamed requests have no readable body, hence no rid key and no
+        // cache namespace: selection keys unpartitioned here, so a request
+        // that needs partitioned affinity must take the buffered path.
+        // Routing-key override is excluded by the body-path gate above.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
         let Some(worker) = self.select_worker_for_model(
             model_id,
             None,
             hinted_tokens.as_deref(),
             Some(req.headers()),
+            None,
             None,
         ) else {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
@@ -2353,7 +2370,14 @@ mod tests {
         let router = create_test_unhealthy_router();
 
         let selected = router
-            .select_worker_for_model(crate::worker::UNKNOWN_MODEL_ID, None, None, None, None)
+            .select_worker_for_model(
+                crate::worker::UNKNOWN_MODEL_ID,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert!(selected.is_available());
 
@@ -2361,7 +2385,14 @@ mod tests {
             worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
         }
         assert!(router
-            .select_worker_for_model(crate::worker::UNKNOWN_MODEL_ID, None, None, None, None)
+            .select_worker_for_model(
+                crate::worker::UNKNOWN_MODEL_ID,
+                None,
+                None,
+                None,
+                None,
+                None
+            )
             .is_none());
     }
 

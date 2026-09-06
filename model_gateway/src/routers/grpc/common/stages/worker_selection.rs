@@ -13,8 +13,8 @@ use super::PipelineStage;
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     policies::{
-        policy_filters_unavailable_workers, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo,
-        WorkerLeg,
+        policy_filters_unavailable_workers, CacheNamespace, LoadBalancingPolicy, PolicyRegistry,
+        SelectWorkerInfo, WorkerLeg,
     },
     routers::{
         common::overload,
@@ -113,17 +113,34 @@ impl PipelineStage for WorkerSelectionStage {
         // would actually read it (tokens win otherwise).
         let keep_text =
             tokens.is_none() || self.policy_registry.any_policy_needs_request_text(headers);
+        // The typed engine wires (gRPC servicers, direct ZMQ) do not carry the
+        // request's cache-partition fields yet, so the engine's prefix cache
+        // is unpartitioned on this path and the router must not split
+        // affinity for it: a namespace here would cost cache hits for every
+        // request that sets a salt today. The snapshot carries the field so
+        // the forwarding change can derive it (as the HTTP proxy path does via
+        // `GenerationRequest::cache_partition`) without touching selection.
+        let cache_namespace: Option<CacheNamespace> = None;
         ctx.state.routing_snapshot = Some(RoutingSnapshot {
             routing_text: keep_text.then(|| text.map(str::to_string)).flatten(),
             token_ids: ids.to_vec(),
             rid_key: rid_key.clone(),
+            cache_namespace,
         });
         let rid_key = rid_key.as_deref();
 
         let model_id = ctx.input.model_id.as_str();
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
-                match self.select_single_worker(model_id, text, tokens, headers, rid_key, None) {
+                match self.select_single_worker(
+                    model_id,
+                    text,
+                    tokens,
+                    headers,
+                    rid_key,
+                    cache_namespace,
+                    None,
+                ) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
                         return Err(self.selection_failure(model_id, &[WorkerType::Regular], None))
@@ -131,7 +148,15 @@ impl PipelineStage for WorkerSelectionStage {
                 }
             }
             WorkerSelectionMode::PrefillDecode => {
-                match self.select_pd_pair(model_id, text, tokens, headers, rid_key, None) {
+                match self.select_pd_pair(
+                    model_id,
+                    text,
+                    tokens,
+                    headers,
+                    rid_key,
+                    cache_namespace,
+                    None,
+                ) {
                     Some((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
                         encode_assignments: None,
                         prefill,
@@ -168,6 +193,7 @@ impl PipelineStage for WorkerSelectionStage {
                     tokens,
                     headers,
                     rid_key,
+                    cache_namespace,
                     &encode_item_hashes,
                 ) {
                     Some((encode_assignments, prefill, decode, runtime_type)) => {
@@ -243,13 +269,22 @@ impl WorkerSelectionStage {
             Some(ctx.routing.token_ids.as_slice())
         };
         let rid_key = ctx.routing.rid_key.as_deref();
+        let cache_namespace = ctx.routing.cache_namespace;
         let headers = ctx.headers.as_ref();
         let model_id = ctx.model_id.as_str();
         let wire = Some(ctx.wire);
 
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
-                match self.select_single_worker(model_id, text, tokens, headers, rid_key, wire) {
+                match self.select_single_worker(
+                    model_id,
+                    text,
+                    tokens,
+                    headers,
+                    rid_key,
+                    cache_namespace,
+                    wire,
+                ) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
                         return Err(self.selection_failure(model_id, &[WorkerType::Regular], wire))
@@ -257,7 +292,15 @@ impl WorkerSelectionStage {
                 }
             }
             WorkerSelectionMode::PrefillDecode | WorkerSelectionMode::EncodePrefillDecode => {
-                match self.select_pd_pair(model_id, text, tokens, headers, rid_key, wire) {
+                match self.select_pd_pair(
+                    model_id,
+                    text,
+                    tokens,
+                    headers,
+                    rid_key,
+                    cache_namespace,
+                    wire,
+                ) {
                     Some((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
                         encode_assignments: None,
                         prefill,
@@ -359,6 +402,10 @@ impl WorkerSelectionStage {
             .collect()
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "selection threads every routing input the policy consumes"
+    )]
     fn select_single_worker(
         &self,
         model_id: &str,
@@ -366,6 +413,7 @@ impl WorkerSelectionStage {
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
+        cache_namespace: Option<CacheNamespace>,
         wire: Option<WireConstraint>,
     ) -> Option<Arc<dyn Worker>> {
         // Get workers for the specified model. The gRPC router serves both gRPC
@@ -422,6 +470,7 @@ impl WorkerSelectionStage {
                 headers,
                 routing_key: self.policy_registry.resolve_routing_key(headers),
                 rid_key,
+                cache_namespace,
                 hash_ring,
                 leg: WorkerLeg::Single,
             },
@@ -453,6 +502,10 @@ impl WorkerSelectionStage {
             .collect()
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "selection threads every routing input the policy consumes"
+    )]
     fn select_pd_pair(
         &self,
         model_id: &str,
@@ -460,6 +513,7 @@ impl WorkerSelectionStage {
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
+        cache_namespace: Option<CacheNamespace>,
         wire: Option<WireConstraint>,
     ) -> Option<PdWorkerPair> {
         // Both legs derive from ONE membership snapshot: separate pool
@@ -551,6 +605,7 @@ impl WorkerSelectionStage {
             headers,
             routing_key: self.policy_registry.resolve_routing_key(headers),
             rid_key,
+            cache_namespace,
             hash_ring,
             leg: WorkerLeg::Prefill,
         };
@@ -595,6 +650,10 @@ impl WorkerSelectionStage {
     /// encode worker. prefill+decode are selected as a normal PD pair. All pools
     /// are filtered to a runtime shared by the selected encode/prefill/decode
     /// legs.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "selection threads every routing input the policy consumes"
+    )]
     fn select_encode_prefill_decode_workers(
         &self,
         model_id: &str,
@@ -602,6 +661,7 @@ impl WorkerSelectionStage {
         tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
+        cache_namespace: Option<CacheNamespace>,
         encode_item_hashes: &[Vec<u8>],
     ) -> Option<EncodePrefillDecodeWorkerSelection> {
         // All three legs derive from ONE membership snapshot (see
@@ -709,6 +769,7 @@ impl WorkerSelectionStage {
             headers,
             routing_key: self.policy_registry.resolve_routing_key(headers),
             rid_key,
+            cache_namespace,
             hash_ring: hash_ring.clone(),
             leg: WorkerLeg::Prefill,
         };
@@ -790,6 +851,7 @@ fn assign_encode_workers(
                 // Encode items key by media-content hash; a conversation key
                 // here would defeat per-item encode reuse.
                 rid_key: None,
+                cache_namespace: None,
                 hash_ring: hash_ring.clone(),
                 leg: WorkerLeg::Single,
             };
@@ -925,7 +987,7 @@ mod tests {
         let mut decode_hits = HashMap::new();
         for _ in 0..iterations {
             let (prefill, decode, _) = stage
-                .select_pd_pair(model_id, None, None, None, None, None)
+                .select_pd_pair(model_id, None, None, None, None, None, None)
                 .expect("select_pd_pair should return a pair");
             *prefill_hits.entry(prefill.url().to_string()).or_default() += 1;
             *decode_hits.entry(decode.url().to_string()).or_default() += 1;
@@ -951,7 +1013,7 @@ mod tests {
             WorkerSelectionMode::PrefillDecode,
         );
         assert!(stage
-            .select_pd_pair(model_id, None, None, None, None, None)
+            .select_pd_pair(model_id, None, None, None, None, None, None)
             .is_some());
 
         for url in &prefill_urls {
@@ -961,7 +1023,7 @@ mod tests {
 
         assert!(
             stage
-                .select_pd_pair(model_id, None, None, None, None, None)
+                .select_pd_pair(model_id, None, None, None, None, None, None)
                 .is_none(),
             "the veto empties the prefill pool"
         );
@@ -1131,7 +1193,7 @@ mod tests {
 
         assert!(
             stage
-                .select_pd_pair(model_id, None, None, None, None, None)
+                .select_pd_pair(model_id, None, None, None, None, None, None)
                 .is_none(),
             "ZMQ-only PD pools must not yield a pair"
         );
@@ -1139,7 +1201,7 @@ mod tests {
         // Adding gRPC legs makes selection succeed, and it never picks the ZMQ ones.
         let (prefill_urls, decode_urls) = register_pd_workers(&worker_registry, model_id, 4);
         let (prefill, decode, _) = stage
-            .select_pd_pair(model_id, None, None, None, None, None)
+            .select_pd_pair(model_id, None, None, None, None, None, None)
             .expect("gRPC PD pair should be selected");
         assert!(prefill_urls.contains(&prefill.url().to_string()));
         assert!(decode_urls.contains(&decode.url().to_string()));
@@ -1186,7 +1248,7 @@ mod tests {
         let mut poison = HeaderMap::new();
         poison.insert("x-smg-routing-key", "req-unique-1".parse().unwrap());
         let first = stage
-            .select_single_worker(model_id, None, None, Some(&poison), rid_key, None)
+            .select_single_worker(model_id, None, None, Some(&poison), rid_key, None, None)
             .unwrap();
         for (i, rid) in ["conv7_t2", "conv7_t2_r1", "conv7_t3"].iter().enumerate() {
             let mut rotated = HeaderMap::new();
@@ -1201,6 +1263,7 @@ mod tests {
                     None,
                     Some(&rotated),
                     policy_registry.derive_rid_key(Some(rid)),
+                    None,
                     None,
                 )
                 .unwrap();
@@ -1239,13 +1302,13 @@ mod tests {
         );
 
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None)
+            .select_single_worker(model_id, None, None, None, None, None, None)
             .is_some());
 
         worker_registry.set_worker_overloaded(&workers[0], true);
         assert!(
             stage
-                .select_single_worker(model_id, None, None, None, None, None)
+                .select_single_worker(model_id, None, None, None, None, None, None)
                 .is_some(),
             "one eligible worker left still serves"
         );
@@ -1253,7 +1316,7 @@ mod tests {
         worker_registry.set_worker_overloaded(&workers[1], true);
         assert!(
             stage
-                .select_single_worker(model_id, None, None, None, None, None)
+                .select_single_worker(model_id, None, None, None, None, None, None)
                 .is_none(),
             "the veto empties the candidate pool"
         );
@@ -1269,7 +1332,7 @@ mod tests {
         // genuinely absent model.
         worker_registry.set_worker_overloaded(&workers[0], false);
         assert!(stage
-            .select_single_worker(model_id, None, None, None, None, None)
+            .select_single_worker(model_id, None, None, None, None, None, None)
             .is_some());
         assert_eq!(
             stage
@@ -1290,6 +1353,7 @@ mod tests {
                 routing_text: None,
                 token_ids: vec![1, 2, 3],
                 rid_key: None,
+                cache_namespace: None,
             },
             wire,
             tokenizer: None,
@@ -1485,5 +1549,91 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "verdict must reflect the pinned pool, not every runtime"
         );
+    }
+
+    /// The namespace lives on the routing snapshot so a retry re-selects in
+    /// the same cache partition: the retained snapshot, not a re-derivation
+    /// from a request that may already be released, decides the key.
+    #[test]
+    fn reselect_keys_affinity_under_the_retained_cache_namespace() {
+        use openai_protocol::common::CachePartition;
+
+        let model_id = "namespace-retry-model";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let workers: Vec<Arc<dyn Worker>> = ["grpc://127.0.0.1:9401", "grpc://127.0.0.1:9402"]
+            .iter()
+            .map(|url| {
+                Arc::new(
+                    BasicWorkerBuilder::new(*url)
+                        .model(ModelCard::new(model_id))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(RuntimeType::Vllm)
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        for worker in &workers {
+            worker_registry.register(Arc::clone(worker)).unwrap();
+        }
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 0,
+                max_tree_size: 4096,
+                block_size: 16,
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
+                cache_index: Default::default(),
+                cache_ttl_secs: 180,
+                cache_boundaries: Vec::new(),
+            })),
+            WorkerSelectionMode::Regular,
+        );
+        let wire = WireConstraint {
+            runtime: RuntimeType::Vllm,
+            connection: ConnectionMode::Grpc,
+        };
+        let namespace = |salt: &str| {
+            CacheNamespace::derive(&CachePartition {
+                cache_salt: Some(salt),
+                extra_key: None,
+                lora_path: None,
+            })
+        };
+        let selected = |ctx: &DispatchContext| match ctx.workers.as_ref().unwrap() {
+            WorkerSelection::Single { worker } => worker.url().to_string(),
+            WorkerSelection::Disaggregated { .. } => panic!("expected single selection"),
+        };
+        let prompt: Vec<u32> = (1..33).collect();
+
+        // Worker 1 is busier, so tenant A's first selection lands on worker 2.
+        workers[0].increment_load();
+        let mut ctx = dispatch_ctx(model_id, wire);
+        ctx.routing.token_ids = prompt.clone();
+        ctx.routing.cache_namespace = namespace("tenant-a");
+        stage.reselect(&mut ctx).unwrap();
+        assert_eq!(selected(&ctx), "grpc://127.0.0.1:9402");
+
+        // A retry from the retained snapshot stays in tenant A's partition
+        // even once worker 2 is the busier one...
+        workers[1].increment_load();
+        workers[1].increment_load();
+        stage.reselect(&mut ctx).unwrap();
+        assert_eq!(selected(&ctx), "grpc://127.0.0.1:9402");
+
+        // ...while a retained snapshot for tenant B misses and takes the
+        // least-loaded worker 1.
+        let mut other = dispatch_ctx(model_id, wire);
+        other.routing.token_ids = prompt;
+        other.routing.cache_namespace = namespace("tenant-b");
+        stage.reselect(&mut other).unwrap();
+        assert_eq!(selected(&other), "grpc://127.0.0.1:9401");
     }
 }

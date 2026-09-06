@@ -40,6 +40,7 @@ use super::{
 };
 use crate::{
     middleware::TenantRequestMeta,
+    policies::CacheNamespace,
     routers::error::internal_error,
     worker::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
 };
@@ -223,6 +224,8 @@ pub(crate) struct RoutingSnapshot {
     pub token_ids: Vec<u32>,
     /// rid-derived sticky key, derived once at first selection.
     pub rid_key: Option<String>,
+    /// The request's cache namespace, derived once at first selection.
+    pub cache_namespace: Option<CacheNamespace>,
 }
 
 /// The wire the retained plan was built for. Retry re-selection filters
