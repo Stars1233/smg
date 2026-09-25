@@ -8,21 +8,11 @@ use rand::RngExt;
 use tracing::debug;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
-use crate::worker::{load_state::LoadSnapshot, Worker};
-
-/// Default KV-pressure weight `λ_t` (seconds): the time-cost of KV contention,
-/// chosen commensurate with the expected-queue-wait term so the two add cleanly.
-pub const DEFAULT_KV_PRESSURE_WEIGHT: f64 = 0.15;
-
-/// Default mean prefill length (tokens), used to estimate in-flight token-work
-/// for a dispatched request whose token count is unknown at routing time.
-pub const DEFAULT_MEAN_PREFILL_TOKENS: u32 = 1024;
-
-/// Default fallback throughput (tokens/s) for the `/throughput` term when a
-/// backend reports KV usage but no live `gen_throughput`. On a homogeneous
-/// fleet its absolute value mainly sets the work-vs-barrier balance, so it
-/// co-tunes with `kv_pressure_weight`.
-pub const DEFAULT_THROUGHPUT: f64 = 2000.0;
+// Retain the public paths used by existing callers and configuration defaults.
+pub use crate::worker::expected_wait::{
+    DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
+};
+use crate::worker::{expected_wait::ExpectedWait, load_state::LoadSnapshot, Worker};
 
 /// Since-poll dispatch tally for one worker.
 #[derive(Clone, Copy, Debug, Default)]
@@ -222,7 +212,7 @@ impl LeastLoadPolicy {
         let url = worker.url();
         match Self::fresh_load(loads, complete_snapshot, url) {
             Some(load) => {
-                let inflight_tokens = inflight.get(url).copied().unwrap_or_default().tokens as f64;
+                let inflight_tokens = inflight.get(url).copied().unwrap_or_default().tokens;
                 let queued_tokens = self.queued_tokens(load);
                 let live_throughput = load.total_gen_throughput();
                 let throughput = if live_throughput > 0.0 {
@@ -230,9 +220,13 @@ impl LeastLoadPolicy {
                 } else {
                     self.default_throughput
                 };
-                let k = load.effective_token_usage().clamp(0.0, 0.999);
-                (queued_tokens + inflight_tokens) / throughput
-                    + self.kv_pressure_weight * k / (1.0 - k)
+                ExpectedWait::new(
+                    queued_tokens,
+                    throughput,
+                    load.effective_token_usage(),
+                    self.kv_pressure_weight,
+                )
+                .seconds(inflight_tokens)
             }
             // No fresh snapshot, but peers report: score it as the best-known
             // reporting peer plus its own live in-flight (count × mean prefill)
